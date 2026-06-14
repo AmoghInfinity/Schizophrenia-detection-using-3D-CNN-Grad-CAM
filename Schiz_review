@@ -1,0 +1,441 @@
+!pip install nibabel
+!pip install torch torchvision torchcam torchview
+!pip install scikit-learn scipy
+
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+import os
+import numpy as np
+import pandas as pd
+import nibabel as nib
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report, confusion_matrix
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from scipy.ndimage import zoom
+from nilearn import datasets
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+BASE_DIR = "/content/drive/MyDrive/coinstac-regression-vbm-data-master"
+
+df1 = pd.read_csv(os.path.join(BASE_DIR, "site_01+02", "site_01+02_large.csv"))
+df2 = pd.read_csv(os.path.join(BASE_DIR, "site_03+04", "site_03+04_large.csv"))
+
+def convert_label(x):
+    return 0 if str(x).upper() == "TRUE" else 1
+
+for df, site in zip([df1, df2], ["site_01+02", "site_03+04"]):
+    df["label"] = df["isControl"].apply(convert_label)
+    df["path"] = df["niftifile"].apply(lambda x: os.path.join(BASE_DIR, site, x))
+
+df_all = pd.concat([df1, df2], ignore_index=True)
+df_all = df_all[df_all["path"].apply(os.path.exists)].reset_index(drop=True)
+
+print("Total subjects:", len(df_all))
+
+class MRIDataset(Dataset):
+    def __init__(self, dataframe, target_shape=(64,64,64)):
+        self.df = dataframe
+        self.target_shape = target_shape
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img = nib.load(row["path"]).get_fdata()
+        img = np.nan_to_num(img)
+
+        img = (img - np.mean(img)) / (np.std(img) + 1e-5)
+        img = torch.tensor(img, dtype=torch.float32).unsqueeze(0)
+
+        if self.target_shape is not None:
+            img = F.interpolate(img.unsqueeze(0), size=self.target_shape,
+                                mode='trilinear', align_corners=False)
+            img = img.squeeze(0)
+
+        label = torch.tensor(row["label"], dtype=torch.long)
+        return img, label
+
+train_df, test_df = train_test_split(
+    df_all, test_size=0.2,
+    stratify=df_all["label"],
+    random_state=42
+)
+
+train_dataset = MRIDataset(train_df)
+test_dataset = MRIDataset(test_df)
+
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False)
+
+"""**CNN Model Initialisation**"""
+
+class CNN3D(nn.Module):
+    def __init__(self, input_shape=(1,64,64,64)):
+        super().__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv3d(1,16,3,padding=1), nn.BatchNorm3d(16), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(16,32,3,padding=1), nn.BatchNorm3d(32), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(32,64,3,padding=1), nn.BatchNorm3d(64), nn.ReLU(), nn.MaxPool3d(2)
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, *input_shape)
+            dummy = self.conv_layers(dummy)
+            n_features = dummy.numel() // dummy.shape[0]
+
+        self.fc_layers = nn.Sequential(
+            nn.Linear(n_features,128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128,2)
+        )
+
+    def forward(self,x):
+        x = self.conv_layers(x)
+        x = x.view(x.size(0),-1)
+        return self.fc_layers(x)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = CNN3D().to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+
+EPOCHS = 40
+
+train_losses = []
+train_accuracies = []
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss, correct = 0.0, 0
+
+    for imgs, labels in tqdm(train_loader):
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        correct += (outputs.argmax(1) == labels).sum().item()
+
+    epoch_loss = running_loss / len(train_loader)
+    epoch_acc = correct / len(train_dataset)
+
+    train_losses.append(epoch_loss)
+    train_accuracies.append(epoch_acc)
+
+    print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f}")
+
+plt.figure(figsize=(12,5))
+
+# Loss plot
+plt.subplot(1,2,1)
+plt.plot(train_losses)
+plt.title("Training Loss vs Epochs")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+
+# Accuracy plot
+plt.subplot(1,2,2)
+plt.plot(train_accuracies)
+plt.title("Training Accuracy vs Epochs")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+
+plt.tight_layout()
+plt.show()
+
+"""**Model Evaluation**"""
+
+model.eval()
+correct, total = 0, 0
+all_labels = []
+all_preds = []
+all_probs = []
+
+with torch.no_grad():
+    for imgs, labels in test_loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        outputs = model(imgs)  # shape: (batch_size, num_classes)
+
+        # preds and probs
+        preds = outputs.argmax(dim=1)
+        probs = F.softmax(outputs, dim=1)[:, 1]  # probability for class 1 (Schizophreniz)
+
+        # update counters
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+
+        # collect for detailed metrics
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+
+all_labels = np.array(all_labels)
+all_preds = np.array(all_preds)
+all_probs = np.array(all_probs)
+
+# Compute metrics
+test_acc_from_counts = correct / total if total > 0 else 0.0
+test_acc = accuracy_score(all_labels, all_preds)
+test_f1 = f1_score(all_labels, all_preds)
+try:
+    test_auc = roc_auc_score(all_labels, all_probs)
+except ValueError:
+    test_auc = float("nan")
+    print("Warning: AUC could not be computed (only one class present in all_labels).")
+
+print(f"\n=== Test Performance ===")
+print(f"Accuracy (counts) : {test_acc_from_counts:.4f}   (Correct: {correct} / Total: {total})")
+print(f"Accuracy (sklearn) : {test_acc:.4f}")
+print(f"F1 Score           : {test_f1:.4f}")
+print(f"AUC                : {test_auc:.4f}")
+
+print("\nClassification Report:")
+print(classification_report(all_labels, all_preds, target_names=["Control", "Schizophrenia"]))
+
+print("Confusion Matrix:")
+print(confusion_matrix(all_labels, all_preds))
+
+"""**Grad-Cam Layer**"""
+
+class GradCAM3D:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.device = next(model.parameters()).device
+        self.target_layer = target_layer
+        self.activations = None
+        self.gradients = None
+
+        target_layer.register_forward_hook(self._forward_hook)
+        target_layer.register_full_backward_hook(self._backward_hook)
+
+    def _forward_hook(self, module, inp, output):
+        self.activations = output.detach()
+
+    def _backward_hook(self, module, grad_in, grad_out):
+        self.gradients = grad_out[0].detach()
+
+    def generate_cam(self, input_tensor, target_class=None):
+        input_tensor = input_tensor.to(self.device)
+        self.model.zero_grad()
+
+        outputs = self.model(input_tensor)
+        if target_class is None:
+            target_class = outputs.argmax(dim=1).item()
+
+        score = outputs[0,target_class]
+        score.backward(retain_graph=True)
+
+        weights = self.gradients.mean(dim=(2,3,4), keepdim=True)
+        cam = (weights * self.activations).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+
+        cam = cam.squeeze().cpu().numpy()
+        cam = cam - cam.min()
+        cam = cam / (cam.max()+1e-8)
+
+        cam_torch = torch.tensor(cam).unsqueeze(0).unsqueeze(0)
+        cam_up = F.interpolate(cam_torch,
+                               size=input_tensor.shape[2:],
+                               mode='trilinear',
+                               align_corners=False)
+
+        return cam_up.squeeze().numpy(), target_class
+
+"""**AAL Initialisation and Scaling**"""
+
+AAL_PATH = "/content/drive/MyDrive/AAL/ROI_MNI_V7_1mm.nii"
+atlas_nii = nib.load(AAL_PATH)
+atlas_data = atlas_nii.get_fdata()
+
+print("Atlas shape:", atlas_data.shape)
+print("Unique labels:", len(np.unique(atlas_data)))
+
+def resample_to_64(volume):
+    factors = (
+        64 / volume.shape[0],
+        64 / volume.shape[1],
+        64 / volume.shape[2]
+    )
+    return zoom(volume, factors, order=0)  # nearest neighbor
+
+atlas_resampled = resample_to_64(atlas_data)
+
+print("Resampled shape:", atlas_resampled.shape)
+
+print(np.unique(atlas_resampled))
+
+hipp_ids = [37, 38]
+stg_ids = [83, 84]          # corrected STG
+thalamus_ids = [77, 78]
+frontal_ids = [3, 4, 7, 8]
+
+hipp_mask = np.isin(atlas_resampled, hipp_ids).astype(int)
+stg_mask = np.isin(atlas_resampled, stg_ids).astype(int)
+thalamus_mask = np.isin(atlas_resampled, thalamus_ids).astype(int)
+frontal_mask = np.isin(atlas_resampled, frontal_ids).astype(int)
+
+# Print labels between 75 and 95 to inspect temporal region
+for val in np.unique(atlas_resampled):
+    if 70 <= val <= 95:
+        print(val)
+print("Percentage STG voxels:",
+      np.sum(stg_mask) / (64*64*64))
+
+print("Hipp voxels:", np.sum(hipp_mask))
+print("STG voxels:", np.sum(stg_mask))
+print("Thalamus voxels:", np.sum(thalamus_mask))
+print("Frontal voxels:", np.sum(frontal_mask))
+
+"""**Dice**"""
+
+#def dice_score(pred, gt):
+    intersection = np.sum(pred * gt)
+    return (2.0 * intersection) / (np.sum(pred) + np.sum(gt) + 1e-8)#
+
+target_layer = model.conv_layers[-4]
+gcam = GradCAM3D(model, target_layer)
+
+dice_results = {
+    "Hippocampus": [],
+    "STG": [],
+    "Thalamus": [],
+    "Frontal": []
+}
+
+model.eval()
+
+for idx in range(len(test_dataset)):
+    img, label = test_dataset[idx]
+    input_tensor = img.unsqueeze(0).to(device)
+
+    cam3d, pred_class = gcam.generate_cam(input_tensor)
+
+    # Only analyze TRUE POSITIVE schizophrenia cases
+    if label.item() == 1 and pred_class == 1:
+
+        # Threshold top 20% CAM voxels
+        threshold = np.percentile(cam3d, 80)
+        cam_mask = (cam3d >= threshold).astype(int)
+
+        # Sanity check shapes
+        if idx == 0:
+            print("CAM shape:", cam_mask.shape)
+            print("Atlas shape:", hipp_mask.shape)
+
+        # Compute Dice
+        dice_results["Hippocampus"].append(dice_score(cam_mask, hipp_mask))
+        dice_results["STG"].append(dice_score(cam_mask, stg_mask))
+        dice_results["Thalamus"].append(dice_score(cam_mask, thalamus_mask))
+        dice_results["Frontal"].append(dice_score(cam_mask, frontal_mask))
+
+for roi, scores in dice_results.items():
+    if len(scores) > 0:
+        print(f"{roi}: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
+    else:
+        print(f"{roi}: No valid samples")
+
+"""**ROI Coverage**"""
+
+def roi_coverage(cam_mask, roi_mask):
+    intersection = np.sum(cam_mask * roi_mask)
+    return intersection / (np.sum(roi_mask) + 1e-8)
+
+coverage_results = {
+    "Hippocampus": [],
+    "STG": [],
+    "Thalamus": [],
+    "Frontal": []
+}
+
+for idx in range(len(test_dataset)):
+    img, label = test_dataset[idx]
+    input_tensor = img.unsqueeze(0).to(device)
+
+    cam3d, pred_class = gcam.generate_cam(input_tensor)
+
+    if label.item() == 1 and pred_class == 1:
+        threshold = np.percentile(cam3d, 80)
+        cam_mask = (cam3d >= threshold).astype(int)
+
+        coverage_results["Hippocampus"].append(roi_coverage(cam_mask, hipp_mask))
+        coverage_results["STG"].append(roi_coverage(cam_mask, stg_mask))
+        coverage_results["Thalamus"].append(roi_coverage(cam_mask, thalamus_mask))
+        coverage_results["Frontal"].append(roi_coverage(cam_mask, frontal_mask))
+
+for roi, scores in coverage_results.items():
+    print(f"{roi} Coverage: {np.mean(scores):.4f}")
+
+random_mask = np.random.randint(0, 2, size=(64,64,64))
+print("Random Hipp Dice:", dice_score(random_mask, hipp_mask))
+
+"""**Permutation Test Coverage**"""
+
+def permutation_test_coverage(cam_mask, roi_mask, n_perm=500):
+    observed = roi_coverage(cam_mask, roi_mask)
+
+    random_scores = []
+
+    flat_cam = cam_mask.flatten()
+
+    for _ in range(n_perm):
+        shuffled = np.random.permutation(flat_cam)
+        shuffled_mask = shuffled.reshape(cam_mask.shape)
+        random_scores.append(roi_coverage(shuffled_mask, roi_mask))
+
+    random_scores = np.array(random_scores)
+
+    p_value = np.mean(random_scores >= observed)
+
+    return observed, np.mean(random_scores), p_value
+
+cam_masks = []
+
+model.eval()
+
+for idx in range(len(test_dataset)):
+    img, label = test_dataset[idx]
+    input_tensor = img.unsqueeze(0).to(device)
+
+    cam3d, pred_class = gcam.generate_cam(input_tensor)
+
+    if label.item() == 1 and pred_class == 1:
+        threshold = np.percentile(cam3d, 80)
+        cam_mask = (cam3d >= threshold).astype(int)
+        cam_masks.append(cam_mask)
+
+mean_cam_mask = np.mean(cam_masks, axis=0)
+mean_cam_mask = (mean_cam_mask >= 0.5).astype(int)
+
+rois = {
+    "Hippocampus": hipp_mask,
+    "STG": stg_mask,
+    "Thalamus": thalamus_mask,
+    "Frontal": frontal_mask
+}
+
+print("\n=== Permutation Test Results (Coverage) ===\n")
+
+for roi_name, roi_mask in rois.items():
+    observed, random_mean, p_value = permutation_test_coverage(
+        mean_cam_mask, roi_mask, n_perm=500
+    )
+
+    print(f"{roi_name}:")
+    print(f"  Observed Coverage: {observed:.4f}")
+    print(f"  Random Mean:       {random_mean:.4f}")
+    print(f"  p-value:           {p_value:.4f}\n")
